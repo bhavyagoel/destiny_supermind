@@ -209,10 +209,11 @@ async def get_data(
             logger.info(f"No data found in AstraDB for {username}, fetching from Instagram")
             try:
                 # Ensure directory exists
-                os.makedirs("./live_data", exist_ok=True)
+                await asyncio.to_thread(lambda: os.makedirs("./live_data", exist_ok=True))
                 
-                # Fetch posts from Instagram
-                await fetch_posts_parallel(
+                # Fetch posts from Instagram - wrapped in asyncio.to_thread since fetch_posts_parallel is synchronous
+                await asyncio.to_thread(
+                    fetch_posts_parallel,
                     username,
                     max_posts=INSTALOADER_FETCH_COUNT,
                     output_file="./live_data/data.json",
@@ -249,7 +250,7 @@ async def get_data(
             finally:
                 # Cleanup
                 if os.path.exists("./live_data/data.json"):
-                    os.remove("./live_data/data.json")
+                    await asyncio.to_thread(lambda: os.remove("./live_data/data.json"))
         
         return result
         
