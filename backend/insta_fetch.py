@@ -63,7 +63,7 @@ def extract_hashtags(caption):
 def clean_caption(caption):
     return re.sub(r'[^a-zA-Z0-9\s]', '', caption) if caption else ""
 
-def writer_thread(output_file: str):
+def writer_thread(output_file: str, write_queue: queue.Queue):
     """Thread for batch writing posts to JSON file"""
     posts_buffer = []
     
@@ -183,7 +183,7 @@ def fetch_profile_chunk(loader_pair: LoaderPair, profile_name: str, start_idx: i
     return posts_fetched
 
 def process_profile_batch(loader_pairs: List[LoaderPair], profiles: List[str], 
-                         max_posts: int, shared_processed_ids: Set[str]):
+                         max_posts: int, shared_processed_ids: Set[str], write_queue: queue.Queue):
     """Process a batch of profiles using multiple loader pairs"""
     posts_per_profile = max_posts
     chunks_per_profile = len(loader_pairs)
@@ -205,7 +205,8 @@ def process_profile_batch(loader_pairs: List[LoaderPair], profiles: List[str],
                         start,
                         end,
                         write_queue,
-                        shared_processed_ids
+                        shared_processed_ids,
+                        write_queue
                     )
                     futures.append(future)
                 
@@ -224,7 +225,7 @@ def fetch_posts_parallel(profiles: List[str], max_posts: int = 1000,
     write_queue = queue.Queue()
     
     # Start writer thread
-    writer = threading.Thread(target=writer_thread, args=(output_file,), daemon=True)
+    writer = threading.Thread(target=writer_thread, args=(output_file, write_queue), daemon=True)
     writer.start()
     
     # Create loader pairs for each worker

@@ -1,146 +1,227 @@
 import json
 import requests
-import warnings
-from typing import Optional
+import os
+import logging
+from typing import Optional, Dict, Any
+from requests.exceptions import RequestException, Timeout
 
-try:
-    from langflow.load import upload_file
-except ImportError:
-    warnings.warn("Langflow provides a function to help you upload files to the flow. Please install langflow to use it.")
-    upload_file = None
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('LangflowClient')
 
-BASE_API_URL = "https://api.langflow.astra.datastax.com"
-ENDPOINT = ""  # You can set a specific endpoint name in the flow settings
+class LangflowError(Exception):
+    """Base exception class for Langflow client errors"""
+    pass
 
-# You can tweak the flow by adding a tweaks dictionary
-#THIS IS A TEMPLATE
-TWEAKS = {
-    "AstraDB-EKNPh": {},
-    "TextInput-IA62h": {
-        "input_value": "USERNAME"
-    },
-    "CombineText-XnSUA": {},
-    "ParseData-bB1wW": {},
-    "CombineText-dpoVZ": {},
-    "ChatOutput-XJAAL": {},
-    "GoogleGenerativeAIModel-Tdtr3": {
-        "model" :"model name",
-        "google_api_key" : "api_key"
-    },
-    "TextInput-QOITS": {
-        "input_value": "QUESTION"
-    }
-}
+class LangflowAPIError(LangflowError):
+    """Exception raised for API-related errors"""
+    def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[dict] = None):
+        self.status_code = status_code
+        self.response = response
+        super().__init__(message)
+
+class LangflowConfigError(LangflowError):
+    """Exception raised for configuration-related errors"""
+    pass
 
 class LangflowClient:
-    def __init__(self, application_token: Optional[str] = APPLICATION_TOKEN, endpoint: Optional[str] = ENDPOINT):
-        self.base_api_url = BASE_API_URL
-        self.langflow_id = LANGFLOW_ID
-        self.flow_id = FLOW_ID
-        self.application_token = application_token
-        self.endpoint = endpoint if endpoint else FLOW_ID
+    def __init__(self, application_token: Optional[str] = None, endpoint: Optional[str] = None):
+        self.base_api_url = os.environ.get('BASE_API_URL')
+        self.langflow_id = os.environ.get('LANGFLOW_ID')
+        self.flow_id = os.environ.get('FLOW_ID')
+        self.application_token = application_token or os.environ.get('APPLICATION_TOKEN')
+        self.endpoint = endpoint or self.flow_id
 
-    def run_flow(self, message: str, output_type: str = "chat", input_type: str = "chat", tweaks: Optional[dict] = None) -> dict:
+        self._validate_config()
+        logger.info(f"LangflowClient initialized with langflow_id: {self.langflow_id}")
+
+    def _validate_config(self) -> None:
+        """Validate the configuration parameters"""
+        missing_params = []
+        for param_name, param_value in [
+            ('BASE_API_URL', self.base_api_url),
+            ('LANGFLOW_ID', self.langflow_id),
+            ('FLOW_ID', self.flow_id)
+        ]:
+            if not param_value:
+                missing_params.append(param_name)
+
+        if missing_params:
+            error_msg = f"Missing required configuration parameters: {', '.join(missing_params)}"
+            logger.error(error_msg)
+            raise LangflowConfigError(error_msg)
+
+    def run_flow(self, message: str, output_type: str = "chat", 
+                 input_type: str = "chat", tweaks: Optional[dict] = None) -> dict:
         """
         Run a flow with a given message and optional tweaks.
 
-        :param message: The message to send to the flow
-        :param output_type: The output type
-        :param input_type: The input type
-        :param tweaks: Optional tweaks to customize the flow
-        :return: The JSON response from the flow
+        Args:
+            message: The message to send to the flow
+            output_type: The output type
+            input_type: The input type
+            tweaks: Optional tweaks to customize the flow
+
+        Returns:
+            dict: The JSON response from the flow
+
+        Raises:
+            LangflowAPIError: If the API request fails
+            RequestException: If there's a network-related error
         """
         api_url = f"{self.base_api_url}/lf/{self.langflow_id}/api/v1/run/{self.endpoint}"
-
+        
         payload = {
             "input_value": message,
             "output_type": output_type,
             "input_type": input_type,
         }
-
-        headers = None
         if tweaks:
             payload["tweaks"] = tweaks
+
+        headers = {}
         if self.application_token:
-            headers = {"Authorization": "Bearer " + self.application_token, "Content-Type": "application/json"}
+            headers["Authorization"] = f"Bearer {self.application_token}"
+            headers["Content-Type"] = "application/json"
 
-        response = requests.post(api_url, json=payload, headers=headers)
-        return response.json()
+        try:
+            logger.debug(f"Sending request to {api_url} with payload: {json.dumps(payload)}")
+            response = requests.post(
+                api_url,
+                json=payload,
+                headers=headers,
+                timeout=30  # Add timeout
+            )
+            
+            response.raise_for_status()
+            return response.json()
 
-    def prepare_tweaks(self, message: str) -> dict:
+        except Timeout:
+            error_msg = "Request timed out while connecting to Langflow API"
+            logger.error(error_msg)
+            raise LangflowAPIError(error_msg)
+
+        except RequestException as e:
+            error_msg = f"Failed to connect to Langflow API: {str(e)}"
+            logger.error(error_msg)
+            raise LangflowAPIError(error_msg)
+
+        except json.JSONDecodeError as e:
+            error_msg = f"Failed to parse API response: {str(e)}"
+            logger.error(error_msg)
+            raise LangflowAPIError(error_msg)
+
+    def prepare_tweaks(self, message: str) -> Dict[str, Any]:
         """
         Prepare the tweaks based on the message.
 
-        :param message: The message to split and customize the flow components
-        :return: A dictionary of tweaks
+        Args:
+            message: The message to split and customize the flow components
+
+        Returns:
+            dict: A dictionary of tweaks
+
+        Raises:
+            LangflowConfigError: If required environment variables are missing
         """
-        message_parts = message.split('-')
-        tweaks = {
-            "AstraDB-EKNPh": {},
-            "TextInput-IA62h": {
-                "input_value": message_parts[0]
-            },
-            "CombineText-XnSUA": {},
-            "ParseData-bB1wW": {},
-            "CombineText-dpoVZ": {},
-            "ChatOutput-XJAAL": {},
-            "GoogleGenerativeAIModel-Tdtr3": {
-                "model": "gemini-1.5-flash",
-            },
-            "TextInput-QOITS": {
-                "input_value": message_parts[1] if len(message_parts) > 1 else ''
+        try:
+            gemini_api_key = os.environ.get('GEMINI_API_KEY')
+            gemini_prompt = os.environ.get('GEMINI_PROMPT')
+            gemini_prompt_2 = os.environ.get('GEMINI_PROMPT_2')
+
+            if not all([gemini_api_key, gemini_prompt, gemini_prompt_2]):
+                raise LangflowConfigError("Missing required Gemini configuration parameters")
+
+            message_parts = message.split('-')
+            tweaks = {
+                "AstraDB-EKNPh": {},
+                "TextInput-IA62h": {
+                    "input_value": message_parts[0].strip()
+                },
+                "CombineText-dpoVZ": {
+                    "first_text": gemini_prompt,
+                    "delimiter": "\\n"
+                },
+                "CombineText-XnSUA": {
+                    "first_text": gemini_prompt_2,
+                    "delimiter": "\\n"
+                },
+                "ParseData-bB1wW": {},
+                "ChatOutput-XJAAL": {},
+                "GoogleGenerativeAIModel-Tdtr3": {
+                    "model": "gemini-1.5-flash",
+                    "google_api_key": gemini_api_key
+                },
+                "TextInput-QOITS": {
+                    "input_value": message_parts[1] if len(message_parts) > 1 else ''
+                }
             }
-        }
-        return tweaks
+            return tweaks
 
-    def upload_file_to_flow(self, file_path: str, components: str, tweaks: dict) -> dict:
+        except Exception as e:
+            error_msg = f"Error preparing tweaks: {str(e)}"
+            logger.error(error_msg)
+            raise LangflowError(error_msg)
+
+    def execute_flow(self, message: str, output_type: str = "chat", 
+                    input_type: str = "chat") -> Dict[str, Any]:
         """
-        Upload a file to the flow.
+        Execute the flow with the given message.
 
-        :param file_path: Path to the file to upload
-        :param components: Components to upload the file to
-        :param tweaks: Tweaks to apply during upload
-        :return: Updated tweaks after file upload
+        Args:
+            message: The message to send to the flow
+            output_type: The output type
+            input_type: The input type
+
+        Returns:
+            dict: The response from the flow
+
+        Raises:
+            LangflowError: If there's an error executing the flow
         """
-        if not upload_file:
-            raise ImportError("Langflow is not installed. Please install it to use the upload_file function.")
-        if not components:
-            raise ValueError("You need to provide the components to upload the file to.")
+        try:
+            logger.info(f"Executing flow with message: {message}")
+            tweaks = self.prepare_tweaks(message)
+            response = self.run_flow(message, output_type, input_type, tweaks)
+            
+            if not response.get("outputs"):
+                raise LangflowError("Invalid response format: missing 'outputs' key")
+            
+            text_response = response["outputs"][0]["outputs"][0]["results"]["message"]["data"]["text"]
+            return {"response": text_response}
 
-        # Upload the file and get updated tweaks
-        return upload_file(file_path=file_path, host=self.base_api_url, flow_id=self.endpoint, components=components, tweaks=tweaks)
+        except (KeyError, IndexError) as e:
+            error_msg = f"Error parsing flow response: {str(e)}"
+            logger.error(error_msg)
+            raise LangflowError(error_msg)
 
-    def execute_flow(self, message: str, output_type: str = "chat", input_type: str = "chat", file_path: Optional[str] = None, components: Optional[str] = None) -> dict:
-        """
-        Execute the flow with the given message and optional file upload.
+def getInsightsFromLangflow(username: str, query: str, client: LangflowClient) -> Dict[str, str]:
+    """
+    Get insights from Langflow.
 
-        :param message: The message to send to the flow
-        :param output_type: The output type
-        :param input_type: The input type
-        :param file_path: Optional file path to upload
-        :param components: Optional components to upload the file to
-        :return: The response from the flow
-        """
-        tweaks = self.prepare_tweaks(message)
+    Args:
+        username: The username
+        query: The query string
+        client: LangflowClient instance
 
-        if file_path:
-            tweaks = self.upload_file_to_flow(file_path=file_path, components=components, tweaks=tweaks)
+    Returns:
+        dict: The response containing insights
 
-        response = self.run_flow(message, output_type, input_type, tweaks)
-        return response
+    Raises:
+        LangflowError: If there's an error getting insights
+    """
+    try:
+        logger.info(f"Getting insights for user: {username}")
+        message = f"{username} - {query}"
+        return client.execute_flow(message=message, output_type="chat", input_type="chat")
 
-
-# Example of how you would use this class:
-if __name__ == "__main__":
-    # Instantiate the LangflowClient
-    client = LangflowClient()
-
-    # Call the `execute_flow` method with parameters
-    response = client.execute_flow(
-        message="username iamsrk - how many likes do i get on average?",
-        output_type="chat",
-        input_type="chat"
-    )
-
-    # Print the response
-    print(json.dumps(response, indent=2))
+    except Exception as e:
+        error_msg = f"Error getting insights: {str(e)}"
+        logger.error(error_msg)
+        raise LangflowError(error_msg)
